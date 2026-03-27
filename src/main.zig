@@ -56,7 +56,10 @@ pub fn main() !void {
     };
 
     // Create TAP interface
-    var tap_dev = tap.Tap.init(args.tap_name, args.mac) catch |err| {
+    // 10.0.0.1/24
+    const tap_ip: u32 = (10 << 24) | (0 << 16) | (0 << 8) | 1;
+    const tap_mask: u32 = (255 << 24) | (255 << 16) | (255 << 8) | 0;
+    var tap_dev = tap.Tap.init(args.tap_name, args.mac, tap_ip, tap_mask) catch |err| {
         log.err("failed to create TAP interface: {}", .{err});
         return err;
     };

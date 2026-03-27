@@ -17,62 +17,50 @@ const MAX_USB_BUF: usize = 4096;
 const SOURCE_EP0: u64 = 0;
 const SOURCE_BULK_OUT: u64 = 1;
 const SOURCE_TAP: u64 = 2;
-const SOURCE_SIGNAL: u64 = 3;
+
+var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn signalHandler(_: c_int) callconv(.c) void {
+    should_exit.store(true, .release);
+}
 
 pub const Bridge = struct {
     ffs_dev: *ffs.Ffs,
     tap_dev: *tap_mod.Tap,
     ax_state: *ax.State,
     epoll_fd: posix.fd_t,
-    signal_fd: posix.fd_t,
 
     pub fn init(ffs_dev: *ffs.Ffs, tap_dev: *tap_mod.Tap, ax_state: *ax.State) !Bridge {
-        const epfd_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (@as(isize, @bitCast(epfd_rc)) < 0) return error.EpollCreate;
-        const epfd: posix.fd_t = @intCast(epfd_rc);
-        errdefer posix.close(epfd);
-
-        // Add ep0 for control events
-        try epollAdd(epfd, ffs_dev.ep0_fd, SOURCE_EP0);
-        // Add bulk OUT for incoming frames from host
-        try epollAdd(epfd, ffs_dev.bulk_out_fd, SOURCE_BULK_OUT);
-        // Add TAP for outgoing frames to host
-        try epollAdd(epfd, tap_dev.fd, SOURCE_TAP);
-
-        // Set up signalfd for clean shutdown
-        var mask = std.mem.zeroes(linux.sigset_t);
-        sigaddset(&mask, linux.SIG.TERM);
-        sigaddset(&mask, linux.SIG.INT);
-
-        const old_act = posix.Sigaction{
-            .handler = .{ .handler = posix.SIG.DFL },
+        // Signal handling via atomic flag (like fan-control)
+        const act = posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
             .mask = std.mem.zeroes(posix.sigset_t),
             .flags = 0,
         };
-        posix.sigaction(linux.SIG.TERM, &old_act, null);
-        posix.sigaction(linux.SIG.INT, &old_act, null);
+        posix.sigaction(posix.SIG.TERM, &act, null);
+        posix.sigaction(posix.SIG.INT, &act, null);
 
-        const rc = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC);
-        const sfd: posix.fd_t = @intCast(rc);
-        if (sfd < 0) return error.SignalFd;
-        errdefer posix.close(sfd);
+        const epfd_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        if (@as(isize, @bitCast(epfd_rc)) < 0) {
+            log.err("epoll_create1 failed: {d}", .{@as(isize, @bitCast(epfd_rc))});
+            return error.EpollCreate;
+        }
+        const epfd: posix.fd_t = @intCast(epfd_rc);
+        errdefer posix.close(epfd);
 
-        // Block signals so they go to signalfd
-        _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
-
-        try epollAdd(epfd, sfd, SOURCE_SIGNAL);
+        try epollAdd(epfd, ffs_dev.ep0_fd, SOURCE_EP0);
+        try epollAdd(epfd, ffs_dev.bulk_out_fd, SOURCE_BULK_OUT);
+        try epollAdd(epfd, tap_dev.fd, SOURCE_TAP);
 
         return .{
             .ffs_dev = ffs_dev,
             .tap_dev = tap_dev,
             .ax_state = ax_state,
             .epoll_fd = epfd,
-            .signal_fd = sfd,
         };
     }
 
     pub fn deinit(self: *Bridge) void {
-        posix.close(self.signal_fd);
         posix.close(self.epoll_fd);
     }
 
@@ -87,12 +75,11 @@ pub const Bridge = struct {
         var tap_read_buf: [MAX_FRAME]u8 = undefined;
         var ep0_data_buf: [256]u8 = undefined;
 
-        while (true) {
-            const nfds = linux.epoll_wait(self.epoll_fd, @ptrCast(&events), events.len, -1);
-            const n: usize = if (@as(isize, @bitCast(nfds)) < 0)
-                continue // EINTR
-            else
-                @intCast(nfds);
+        while (!should_exit.load(.acquire)) {
+            const nfds = linux.epoll_wait(self.epoll_fd, @ptrCast(&events), events.len, 1000);
+            const signed: isize = @bitCast(nfds);
+            if (signed < 0) continue; // EINTR or signal
+            const n: usize = @intCast(nfds);
 
             for (events[0..n]) |ev| {
                 switch (ev.data.u64) {
@@ -115,14 +102,12 @@ pub const Bridge = struct {
                             log.err("TAP read error: {}", .{err});
                         };
                     },
-                    SOURCE_SIGNAL => {
-                        log.info("signal received, shutting down", .{});
-                        return;
-                    },
                     else => {},
                 }
             }
         }
+
+        log.info("signal received, shutting down", .{});
     }
 
     fn handleEp0(self: *Bridge, data_buf: *[256]u8) !void {
@@ -134,7 +119,6 @@ pub const Bridge = struct {
                 const is_in = (setup.bRequestType & 0x80) != 0;
 
                 if (is_in) {
-                    // Host wants to read data (IN transfer)
                     const resp = self.ax_state.handleControl(
                         setup.bRequestType,
                         setup.bRequest,
@@ -149,7 +133,6 @@ pub const Bridge = struct {
                         .stall => try self.ffs_dev.writeEp0(&.{}),
                     }
                 } else {
-                    // Host is sending data (OUT transfer)
                     const wlen = std.mem.littleToNative(u16, setup.wLength);
                     if (wlen > 0) {
                         const n = try self.ffs_dev.readEp0(data_buf);
@@ -276,16 +259,13 @@ fn epollAdd(epfd: posix.fd_t, fd: posix.fd_t, tag: u64) !void {
         .data = .{ .u64 = tag },
     };
     const rc = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, fd, &ev);
-    if (@as(isize, @bitCast(rc)) < 0) return error.EpollCtl;
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) {
+        log.err("epoll_ctl ADD failed for fd {d}: errno {d}", .{ fd, -signed });
+        return error.EpollCtl;
+    }
 }
 
 fn alignUp(val: usize, alignment: usize) usize {
     return (val + alignment - 1) & ~(alignment - 1);
-}
-
-fn sigaddset(set: *linux.sigset_t, sig: u6) void {
-    const s: usize = @intCast(sig);
-    const word = (s - 1) / @bitSizeOf(usize);
-    const bit: std.math.Log2Int(usize) = @intCast((s - 1) % @bitSizeOf(usize));
-    set.*[word] |= @as(usize, 1) << bit;
 }

@@ -9,6 +9,7 @@ const FUNCTIONFS_DESCRIPTORS_MAGIC_V2: u32 = 3;
 const FUNCTIONFS_STRINGS_MAGIC: u32 = 2;
 
 // FunctionFS flags
+const FUNCTIONFS_HAS_FS_DESC: u32 = 1;
 const FUNCTIONFS_HAS_HS_DESC: u32 = 2;
 const FUNCTIONFS_HAS_SS_DESC: u32 = 4;
 const FUNCTIONFS_ALL_CTRL_RECIP: u32 = 64;
@@ -142,32 +143,32 @@ fn writeDescriptors(ep0: std.fs.File) !void {
     const header_size = 12; // magic(4) + length(4) + flags(4)
     pos = header_size;
 
-    const flags: u32 = FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC | FUNCTIONFS_ALL_CTRL_RECIP;
+    const flags: u32 = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC | FUNCTIONFS_ALL_CTRL_RECIP;
 
-    // hs_count and ss_count
+    // fs_count, hs_count, ss_count
+    writeU32LE(&buf, &pos, 4); // fs_count: 1 interface + 3 endpoints
     writeU32LE(&buf, &pos, 4); // hs_count: 1 interface + 3 endpoints
     writeU32LE(&buf, &pos, 7); // ss_count: 1 interface + 3 endpoints + 3 SS companion
 
-    // --- High-Speed descriptors ---
-    // Interface descriptor
+    // --- Full-Speed descriptors ---
+    // descs[0] must be populated — kernel dereferences it when binding HS/SS endpoints
     writeInterfaceDesc(&buf, &pos);
-    // Bulk IN (EP1, 0x81)
+    writeEndpointDesc(&buf, &pos, 0x81, 0x02, 64, 0); // Bulk IN, FS max = 64
+    writeEndpointDesc(&buf, &pos, 0x02, 0x02, 64, 0); // Bulk OUT, FS max = 64
+    writeEndpointDesc(&buf, &pos, 0x83, 0x03, 8, 255); // Interrupt IN, FS interval = 255ms
+
+    // --- High-Speed descriptors ---
+    writeInterfaceDesc(&buf, &pos);
     writeEndpointDesc(&buf, &pos, 0x81, 0x02, 512, 0);
-    // Bulk OUT (EP2, 0x02)
     writeEndpointDesc(&buf, &pos, 0x02, 0x02, 512, 0);
-    // Interrupt IN (EP3, 0x83)
     writeEndpointDesc(&buf, &pos, 0x83, 0x03, 8, 11);
 
     // --- Super-Speed descriptors ---
-    // Interface descriptor
     writeInterfaceDesc(&buf, &pos);
-    // Bulk IN + SS companion
     writeEndpointDesc(&buf, &pos, 0x81, 0x02, 1024, 0);
     writeSsCompanionDesc(&buf, &pos, 0, 0);
-    // Bulk OUT + SS companion
     writeEndpointDesc(&buf, &pos, 0x02, 0x02, 1024, 0);
     writeSsCompanionDesc(&buf, &pos, 0, 0);
-    // Interrupt IN + SS companion
     writeEndpointDesc(&buf, &pos, 0x83, 0x03, 8, 11);
     writeSsCompanionDesc(&buf, &pos, 0, 0);
 
